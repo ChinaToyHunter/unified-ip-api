@@ -1,0 +1,160 @@
+name: Build images
+
+# Builds the two images of the Unified IP Information API straight from the MyIP
+# fork and pushes them to GHCR:
+#
+#   ghcr.io/<owner>/myip                      — main image (repo-root Dockerfile)
+#   ghcr.io/<owner>/myip-ipquality-sidecar    — egress probe (ipquality-sidecar/)
+#
+# Why the workflow lives here instead of in the fork: the fork tracks
+# jason5ng32/MyIP, so a fork-only workflow file in it would be a standing merge
+# conflict on every upstream sync. This repository owns the build (and later the
+# deploy) concerns so the fork keeps nothing but upstream history plus its
+# feature branch; the source of truth is still the fork, checked out by `ref`.
+#
+# No secrets are required. Both repositories are public, so checkout reads the
+# fork anonymously, and the GHCR push uses the workflow's own GITHUB_TOKEN.
+# Nothing else is needed to *build*: provider API keys and the GeoLite2
+# databases are runtime data — .dockerignore keeps the .mmdb files out of the
+# build context on purpose, so a container downloads fresh data on first boot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref in ChinaToyHunter/MyIP
+        required: true
+        default: feat/unified-v1
+        type: string
+      push:
+        description: Push the built images to GHCR
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [main]
+
+# Least-privilege GITHUB_TOKEN: contents:read to check out the source,
+# packages:write to publish to ghcr.io.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  main-image:
+    name: Main image
+    runs-on: ubuntu-latest
+    # The front-end build dominates this job; a hosted runner that loses its
+    # connection would otherwise sit "in progress" for the 6h default.
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the source (MyIP fork)
+        uses: actions/checkout@v6
+        with:
+          repository: ChinaToyHunter/MyIP
+          ref: ${{ inputs.ref || 'feat/unified-v1' }}
+
+      # github.sha is this repository's commit, not the source's — tag the image
+      # with the revision that was actually compiled.
+      - name: Record the source revision
+        id: src
+        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push != false }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ inputs.push != false }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/myip:latest
+            ghcr.io/${{ github.repository_owner }}/myip:sha-${{ steps.src.outputs.sha }}
+          # amd64 only: the sidecar's build assertions would otherwise run under
+          # QEMU for arm64, and nothing consumes arm64 yet.
+          platforms: linux/amd64
+          # Separate scope per job so the two builds don't evict each other's cache.
+          cache-from: type=gha,scope=myip-main
+          cache-to: type=gha,scope=myip-main,mode=max
+
+  sidecar:
+    name: Egress probe sidecar
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the source (MyIP fork)
+        uses: actions/checkout@v6
+        with:
+          repository: ChinaToyHunter/MyIP
+          ref: ${{ inputs.ref || 'feat/unified-v1' }}
+
+      - name: Record the source revision
+        id: src
+        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push != false }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The build fetches the pinned IPQuality revision and asserts the toolchain
+      # the probes invoke (netcat-openbsd's `nc -s`, GNU timeout/xargs, dig, ss,
+      # clear) — a base image missing one of them fails here instead of leaving a
+      # probe section silently reporting nothing at run time. Loaded rather than
+      # pushed so the smoke test below gates what gets published.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: ipquality-sidecar
+          load: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:latest
+            ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:sha-${{ steps.src.outputs.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=myip-sidecar
+          cache-to: type=gha,scope=myip-sidecar,mode=max
+
+      # The probe itself only ever runs against a real deployment, so at least
+      # prove the image boots and answers its own health endpoint.
+      - name: Smoke test — boot the sidecar and hit /healthz
+        run: |
+          set -euo pipefail
+          image=ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:latest
+          docker run -d --name sidecar -p 8080:8080 "$image"
+          ok=0
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs sidecar || true
+          docker rm -f sidecar >/dev/null
+          test "$ok" = "1"
+
+      - name: Push
+        if: ${{ inputs.push != false }}
+        run: |
+          set -euo pipefail
+          base=ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar
+          docker push "$base:latest"
+          docker push "$base:sha-${{ steps.src.outputs.sha }}"
