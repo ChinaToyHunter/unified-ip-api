@@ -34,6 +34,13 @@ on:
   push:
     branches: [main]
 
+env:
+  # Whether this run publishes to GHCR. Normalised here because a bare
+  # `inputs.push != false` is wrong on the push event: `inputs.push` is then
+  # null, and GitHub's coercing comparison makes null == false true (both cast
+  # to 0), which silently skips the login step.
+  PUSH_IMAGES: ${{ github.event_name == 'push' || inputs.push }}
+
 # Least-privilege GITHUB_TOKEN: contents:read to check out the source,
 # packages:write to publish to ghcr.io.
 permissions:
@@ -60,16 +67,21 @@ jobs:
           ref: ${{ inputs.ref || 'feat/unified-v1' }}
 
       # github.sha is this repository's commit, not the source's — tag the image
-      # with the revision that was actually compiled.
-      - name: Record the source revision
-        id: src
-        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      # with the revision that was actually compiled. The owner is lowercased
+      # because `github.repository_owner` preserves its spelling and a Docker
+      # tag may not contain uppercase.
+      - name: Resolve the source revision and image names
+        id: img
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ref=ghcr.io/${owner}/myip" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        if: ${{ inputs.push != false }}
+        if: env.PUSH_IMAGES == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -80,10 +92,10 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: ${{ inputs.push != false }}
+          push: ${{ env.PUSH_IMAGES == 'true' }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/myip:latest
-            ghcr.io/${{ github.repository_owner }}/myip:sha-${{ steps.src.outputs.sha }}
+            ${{ steps.img.outputs.ref }}:latest
+            ${{ steps.img.outputs.ref }}:sha-${{ steps.img.outputs.sha }}
           # amd64 only: the sidecar's build assertions would otherwise run under
           # QEMU for arm64, and nothing consumes arm64 yet.
           platforms: linux/amd64
@@ -103,15 +115,18 @@ jobs:
           repository: ChinaToyHunter/MyIP
           ref: ${{ inputs.ref || 'feat/unified-v1' }}
 
-      - name: Record the source revision
-        id: src
-        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve the source revision and image names
+        id: img
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ref=ghcr.io/${owner}/myip-ipquality-sidecar" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        if: ${{ inputs.push != false }}
+        if: env.PUSH_IMAGES == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -129,8 +144,8 @@ jobs:
           context: ipquality-sidecar
           load: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:latest
-            ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:sha-${{ steps.src.outputs.sha }}
+            ${{ steps.img.outputs.ref }}:latest
+            ${{ steps.img.outputs.ref }}:sha-${{ steps.img.outputs.sha }}
           platforms: linux/amd64
           cache-from: type=gha,scope=myip-sidecar
           cache-to: type=gha,scope=myip-sidecar,mode=max
@@ -140,7 +155,7 @@ jobs:
       - name: Smoke test — boot the sidecar and hit /healthz
         run: |
           set -euo pipefail
-          image=ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar:latest
+          image="${{ steps.img.outputs.ref }}:latest"
           docker run -d --name sidecar -p 8080:8080 "$image"
           ok=0
           for _ in $(seq 1 20); do
@@ -152,9 +167,9 @@ jobs:
           test "$ok" = "1"
 
       - name: Push
-        if: ${{ inputs.push != false }}
+        if: env.PUSH_IMAGES == 'true'
         run: |
           set -euo pipefail
-          base=ghcr.io/${{ github.repository_owner }}/myip-ipquality-sidecar
-          docker push "$base:latest"
-          docker push "$base:sha-${{ steps.src.outputs.sha }}"
+          ref="${{ steps.img.outputs.ref }}"
+          docker push "$ref:latest"
+          docker push "$ref:sha-${{ steps.img.outputs.sha }}"
